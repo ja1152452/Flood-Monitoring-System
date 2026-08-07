@@ -1,0 +1,243 @@
+import cv2
+import numpy as np
+import json
+from datetime import datetime
+
+print("=== Lumban Flood Monitor — Live Detection ===")
+
+with open("calibration.json") as f:
+    CAL = json.load(f)
+
+RTSP_URL         = CAL["rtsp_url"]
+BASELINE_PIXEL_Y = CAL["baseline_pixel_y"]
+BASELINE_METERS  = CAL["baseline_meters"]
+PX_PER_METER     = CAL["px_per_meter"]
+
+COLOR_RANGES = {
+  "yellow": ([20, 100, 100], [78, 255, 255]),
+  "orange": ([10, 100, 100], [20, 255, 255]),
+  "red": ([0, 100, 100], [20, 255, 255]),
+  "purple": ([125, 85, 85], [155, 255, 255]),
+}
+
+FLOOD_THRESHOLDS = [
+    (0.0,  3.1,  "NORMAL"),
+    (3.1,  4.1,  "MONITOR"),
+    (4.1,  5.1,  "ALERT"),
+    (5.1,  6.1,  "EVACUATION"),
+    (6.1,  99.0, "CRITICAL"),
+]
+
+LEVEL_COLORS_BGR = {
+    "NORMAL":     (200, 200, 200),
+    "MONITOR":    (0,   200, 255),
+    "ALERT":      (0,   140, 255),
+    "EVACUATION": (0,   0,   220),
+    "CRITICAL":   (180, 0,   180),
+}
+
+def classify(water_level_m):
+    for low, high, level in FLOOD_THRESHOLDS:
+        if low <= water_level_m < high:
+            return level
+    return "CRITICAL"
+
+def detect_waterline(frame):
+    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, w = frame.shape[:2]
+
+    roi_top    = int(h * 0.05)
+    roi_bottom = int(h * 0.95)
+    roi_left   = int(w * 0.25)
+    roi_right  = int(w * 0.75)
+
+    hsv_roi = hsv[roi_top:roi_bottom, roi_left:roi_right]
+
+    combined_mask = np.zeros(hsv_roi.shape[:2], dtype=np.uint8)
+    for name, (lower, upper) in COLOR_RANGES.items():
+        mask = cv2.inRange(hsv_roi, np.array(lower), np.array(upper))
+        combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+    kernel        = np.ones((7, 7), np.uint8)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN,  kernel)
+
+    contours, _ = cv2.findContours(
+        combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return {"success": False, "reason": "No colored marker detected in frame"}
+
+    min_area = (roi_bottom - roi_top) * (roi_right - roi_left) * 0.005
+
+    significant = [c for c in contours if cv2.contourArea(c) > min_area]
+
+    if not significant:
+        return {"success": False, "reason": "Marker too small — move camera closer"}
+
+    lowest_bottom_y = 0
+    total_area      = 0
+
+    for c in significant:
+        x, y, bw, bh = cv2.boundingRect(c)
+        bottom_y = roi_top + y + bh
+        if bottom_y > lowest_bottom_y:
+            lowest_bottom_y = bottom_y
+        total_area += cv2.contourArea(c)
+
+    waterline_y = lowest_bottom_y
+
+    confidence  = min(
+        total_area / ((roi_bottom - roi_top) * (roi_right - roi_left) * 0.3),
+        1.0
+    )
+
+    pixel_delta   = BASELINE_PIXEL_Y - waterline_y
+    water_level_m = BASELINE_METERS + (pixel_delta / PX_PER_METER)
+    water_level_m = max(0.0, round(water_level_m, 3))
+
+    flood_level = classify(water_level_m)
+
+    return {
+        "success":           True,
+        "water_level_m":     water_level_m,
+        "flood_level":       flood_level,
+        "waterline_pixel_y": waterline_y,
+        "confidence":        round(confidence, 3),
+        "roi": {
+            "top":    roi_top,
+            "bottom": roi_bottom,
+            "left":   roi_left,
+            "right":  roi_right,
+        },
+    }
+
+def annotate_frame(frame, result):
+    annotated = frame.copy()
+    h, w      = frame.shape[:2]
+
+    roi = result.get("roi", {})
+    cv2.rectangle(
+        annotated,
+        (roi.get("left", 0),  roi.get("top", 0)),
+        (roi.get("right", w), roi.get("bottom", h)),
+        (200, 200, 0), 1
+    )
+
+    if result["success"]:
+        y          = result["waterline_pixel_y"]
+        level      = result["flood_level"]
+        color      = LEVEL_COLORS_BGR.get(level, (255, 255, 255))
+        water_m    = result["water_level_m"]
+        confidence = result["confidence"]
+
+        cv2.line(annotated, (0, y), (w, y), color, 3)
+
+        cv2.rectangle(annotated, (10, 10), (520, 85), (0, 0, 0), -1)
+        cv2.rectangle(annotated, (10, 10), (520, 85), color, 2)
+
+        cv2.putText(annotated,
+                    f"{level} LEVEL",
+                    (20, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+        cv2.putText(annotated,
+                    f"Water: {water_m:.2f} meters    Confidence: {confidence:.0%}",
+                    (20, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        cv2.line(annotated,
+                 (w - 20, BASELINE_PIXEL_Y),
+                 (w, BASELINE_PIXEL_Y),
+                 (150, 150, 150), 1)
+        cv2.putText(annotated,
+                    f"{BASELINE_METERS:.1f}m baseline",
+                    (w - 180, BASELINE_PIXEL_Y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+    else:
+        cv2.rectangle(annotated, (10, 10), (700, 60), (0, 0, 0), -1)
+        cv2.rectangle(annotated, (10, 10), (700, 60), (0, 0, 200), 2)
+        cv2.putText(annotated,
+                    f"DETECTION FAILED: {result['reason']}",
+                    (18, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cv2.putText(annotated,
+                f"Lumban Flood Monitor  |  {ts}  |  Q=quit  S=save",
+                (10, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (130, 130, 130), 1)
+
+    return annotated
+
+def grab_frame(cap):
+    for _ in range(5):
+        cap.grab()
+    ret, frame = cap.retrieve()
+    return frame if ret else None
+
+def main():
+    print("")
+    print("Detection logic: BOTTOM of LOWEST visible colored band = waterline")
+    print("")
+    print("Thresholds:")
+    for low, high, level in FLOOD_THRESHOLDS:
+        print(f"  {level:12s}  {low:.1f}m – {high:.1f}m")
+    print("")
+    print("Connecting to camera...")
+
+    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        print("ERROR: Cannot connect to camera.")
+        return
+
+    print("Camera connected!")
+    print("Press Q to quit, S to save frame.")
+    print("")
+
+    while True:
+        frame = grab_frame(cap)
+
+        if frame is None:
+            print("Frame grab failed — reconnecting...")
+            cap.release()
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            continue
+
+        result    = detect_waterline(frame)
+        annotated = annotate_frame(frame, result)
+
+        if result["success"]:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}]  "
+                f"Water: {result['water_level_m']:.3f}m  |  "
+                f"Status: {result['flood_level']:12s}  |  "
+                f"Confidence: {result['confidence']:.0%}"
+            )
+        else:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}]  "
+                f"FAILED — {result['reason']}"
+            )
+
+        cv2.imshow("Lumban Flood Monitor", annotated)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            fname = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(fname, annotated)
+            print(f"Saved: {fname}")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Detection stopped.")
+
+if __name__ == "__main__":
+    main()
